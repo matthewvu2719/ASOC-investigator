@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import tempfile
+import uuid
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
@@ -30,6 +33,8 @@ from .streaming import stream_graph_events
 load_dotenv()
 
 app = FastAPI(title="ASOC Investigator API", version="0.1.0")
+
+_UPLOAD_DIR = Path(tempfile.gettempdir()) / "asoc_investigator_uploads"
 
 # Local Next.js dev server. Add your deployed frontend origin here too once
 # this leaves localhost.
@@ -55,18 +60,29 @@ def health() -> dict:
 
 def _resolve_input(
     log_text: str | None, file: UploadFile | None, file_bytes: bytes | None
-) -> tuple[str, str]:
+) -> tuple[str, str, Path | None]:
+    """Returns (raw_input, input_kind, temp_file_path). temp_file_path is
+    non-None only for the file-upload case — the caller must delete it once
+    the investigation is done (see investigate_stream's event_generator)."""
     if file is not None and file_bytes is not None:
-        # v0.1 does not upload/detonate real file bytes — see
-        # docs/ARCHITECTURE.md "What's stubbed vs. real". Metadata only,
-        # so the sandbox tool has a file_reference to act on.
+        _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        # Path(...).name strips any path components from the client-supplied
+        # filename — never trust it as a path segment directly.
+        safe_name = Path(file.filename or "upload").name
+        tmp_path = _UPLOAD_DIR / f"{uuid.uuid4().hex}_{safe_name}"
+        tmp_path.write_bytes(file_bytes)
+
+        # A real, readable path — same as what the CLI puts here for a
+        # local file. It gets masked like any other entity in the text,
+        # and tools/sandbox.py reads bytes from it after unmasking.
         raw_input = (
             f"File submitted for analysis: {file.filename}\n"
+            f"Path: {tmp_path.resolve()}\n"
             f"Size: {len(file_bytes)} bytes"
         )
-        return raw_input, "file"
+        return raw_input, "file", tmp_path
     if log_text:
-        return log_text, "log"
+        return log_text, "log", None
     raise HTTPException(status_code=400, detail="Provide log_text or a file.")
 
 
@@ -135,7 +151,7 @@ async def investigate_stream(
     file: UploadFile | None = File(default=None),
 ):
     file_bytes = await file.read() if file is not None else None
-    raw_input, input_kind = _resolve_input(log_text, file, file_bytes)
+    raw_input, input_kind, tmp_path = _resolve_input(log_text, file, file_bytes)
 
     graph = build_graph(
         investigator_model=investigator_model,
@@ -156,6 +172,10 @@ async def investigate_stream(
                     return
                 yield f"data: {json.dumps(_serialize_update(update))}\n\n"
         finally:
+            # Clean up the temp upload only after the graph is fully done
+            # with it — detonate_file may read this path mid-run.
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
             yield "event: done\ndata: {}\n\n"
 
     return StreamingResponse(

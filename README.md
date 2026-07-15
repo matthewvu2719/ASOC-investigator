@@ -27,18 +27,20 @@ the rest of the code — see `docs/ARCHITECTURE.md` "Agents".
 
 v0.1 — architecture and pipeline are real and tested (masking round-trip,
 the tool mask/unmask boundary, RAG store degrade-gracefully behavior, and
-graph compilation all have smoke tests in `scripts/`). Threat intel
-(VirusTotal + AlienVault OTX) is **real** when `VIRUSTOTAL_API_KEY` /
-`OTX_API_KEY` are set, and falls back to a deterministic mock otherwise.
-Sandbox is still **mocked** — see the "What's stubbed vs. real" table in
-`docs/ARCHITECTURE.md` for exactly what's left to swap for production use.
+graph compilation all have smoke tests in `scripts/`). Both external tools
+are real: threat intel (VirusTotal + AlienVault OTX) when
+`VIRUSTOTAL_API_KEY` / `OTX_API_KEY` are set, and sandbox detonation
+(Hybrid Analysis) when `HYBRID_ANALYSIS_API_KEY` is set — both fall back
+to a deterministic mock otherwise. See `docs/ARCHITECTURE.md` §11 for the
+full real-vs-mocked breakdown.
 
 The end-to-end LLM run (investigator + judge, which need a live
 `OPENAI_API_KEY`) has not been exercised yet in this environment — do that
 first before trusting the pipeline beyond the component-level tests. The
-VirusTotal/OTX integration specifically has also only been verified against
-their documented API shapes, not live-tested against real keys — the mock
-fallback path is what's actually been run.
+VirusTotal/OTX/Hybrid Analysis integrations have likewise only been
+verified against their documented API shapes and offline logic (routing,
+classification, error handling), not live-tested against real keys — the
+mock fallback path is what's actually been run for all three.
 
 ## Setup
 
@@ -99,12 +101,23 @@ neither and it falls back to a deterministic mock shaped like the real
 responses (this is the only path actually exercised so far in this
 environment — see "Status" above).
 
-### Optional: real sandbox provider
+### Sandbox: Hybrid Analysis
 
-`tools/sandbox.py` is still mocked. Real detonation (e.g. Hybrid Analysis)
-is async — submit, then poll for a report — so wiring it up needs a poll
-loop added to the tool, not just a swapped function body like the threat
-intel tools above.
+`tools/detonate_file` calls [Hybrid Analysis](https://www.hybrid-analysis.com)
+(Falcon Sandbox) once `HYBRID_ANALYSIS_API_KEY` is set (free tier via
+account signup → profile → API key). Checks for an existing report by hash
+first (fast, no submission needed); on a miss, submits the file and polls
+for up to 4 minutes. Set neither key and it falls back to the same
+deterministic mock as before.
+
+For a **file path** reference, it reads the bytes straight off disk —
+either your local machine (CLI) or a server-side temp copy of a web
+upload, cleaned up after the investigation finishes (see
+`docs/ARCHITECTURE.md` §10 for exactly how uploaded bytes get from the
+frontend to this tool). For a bare **hash** reference, it's an
+existing-report lookup only — there's no file to submit.
+
+Unset the key and it's the deterministic mock, unchanged from before.
 
 ## Usage
 

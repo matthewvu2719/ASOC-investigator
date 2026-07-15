@@ -61,7 +61,7 @@ backend + Next.js frontend with live streaming progress).
                                                 │       │                   │
                                                 │  investigator (ReAct) ───┼──▶ VirusTotal
                                                 │       │       │           │  ▶ AlienVault OTX
-                                                │       │       └──────────┼──▶ sandbox (mocked)
+                                                │       │       └──────────┼──▶ Hybrid Analysis (sandbox)
                                                 │       ▼                   │
                                                 │     judge                 │
                                                 │       │  (loop, max 3)    │
@@ -84,7 +84,7 @@ src/asoc_investigator/
   tools/
     base.py           # ToolSpec + the mask-aware wrapper (the safety boundary)
     threat_intel.py   # threat_intel_lookup — real VirusTotal + OTX, mock fallback
-    sandbox.py         # detonate_file — mocked
+    sandbox.py         # detonate_file — real Hybrid Analysis (submit+poll), mock fallback
     registry.py         # binds ToolSpecs to one investigation's MaskingEngine
   rag/
     embeddings.py       # Embedder protocol: OpenAIEmbedder (real) / HashingEmbedder (fallback)
@@ -249,9 +249,16 @@ independent model parameters — currently both default to OpenAI.
   deterministic router, **not an LLM call**. Reads the judge's last
   verdict and the iteration counter to decide "back to investigator" vs
   "finalize." Holds the max-3-loops budget.
-- **Investigator** (`agents/investigator.py`) — a ReAct agent
+- **Investigator** (`agents/investigator.py`) — a **ReAct** agent
   (`langgraph.prebuilt.create_react_agent`) on OpenAI (`ChatOpenAI`,
-  default `gpt-4.1`), bound to the mask-aware tools (§10). System prompt
+  default `gpt-4.1`), bound to the mask-aware tools (§10). "ReAct"
+  (Reason + Act) is the standard tool-use agent pattern: the LLM
+  alternates between reasoning about what it needs next and emitting a
+  tool call, reads the tool's result back into the *same* conversation,
+  reasons about that, and repeats — calling more tools or stopping to
+  produce a final answer — until it decides it has enough to answer
+  without another tool call. `create_react_agent` implements exactly this
+  loop; nothing about it is bespoke to this project. System prompt
   explicitly tells it the input is masked and instructs it never to try to
   guess/reconstruct real values — that's by design, not a limitation to
   work around. Produces a draft report: summary, per-indicator findings
@@ -279,6 +286,79 @@ Both model IDs are independent parameters everywhere: `build_graph(
 investigator_model=..., judge_model=...)`, `--investigator-model` /
 `--judge-model` on the CLI, `investigator_model` / `judge_model` fields on
 the API request bodies.
+
+### Why ReAct here, not a fixed pipeline
+
+Worth being honest that ReAct isn't the only option, and is arguably more
+than the current tool set strictly needs — it's a real tradeoff, not an
+obvious choice.
+
+**What it buys**: the investigator only ever sees opaque masked tokens
+(`IP_A3F9`, `DOMAIN_1FA9`, ...) with no way to know in advance which
+represent real signal vs. noise — an internal `10.0.5.23` isn't worth a
+VirusTotal call; an external IP probably is. A ReAct agent can exercise
+judgment about *which* indicators are worth investigating and in what
+order, rather than blindly checking every single one — which matters
+given VirusTotal's free tier is 4 requests/minute, so naively checking
+every token in a busy log would burn through quota fast. It also means
+future conditional logic ("if OTX flags a specific campaign, dig into it
+further") is just a prompt change, not a rewrite.
+
+**The honest alternative**: with only two tools, and a token list the
+masking engine already hands you cleanly typed
+(`engine.known_tokens()`, `entity_type_of()`), this could instead be a
+fully deterministic pipeline — loop over every known token by type, call
+the matching tool on each in plain code, then a single LLM call at the end
+to synthesize a report from all the masked results. That would be more
+predictable, cheaper (no reasoning overhead, no risk of the model skipping
+something it shouldn't), and easier to test than an agent loop.
+
+**When each is the right call**: ReAct earns its complexity if the tool
+surface and investigation logic keep growing and relevance judgment stays
+valuable. **This is the actual reason it's kept here** — the plan is to
+extend the investigator with more tools over time, at which point
+"decide which of N tools are relevant, in what order, and whether a result
+warrants a follow-up call" stops being optional and becomes exactly the
+problem ReAct solves. For today's 2-tool set alone it would be defensible
+to call this over-engineered; it stops being over-engineered the moment a
+third or fourth tool shows up and the deterministic "call everything"
+pipeline would otherwise need hand-written branching logic to decide what
+to skip and what to chain.
+
+### Worked example: a tool call, end to end
+
+It's easy to conflate "the investigator calls a tool" with "an LLM
+evaluates the tool's result" as two separate model calls. They aren't —
+it's one continuous reasoning loop, with a genuinely separate model call
+only happening afterward, over the finished draft. Concretely, for a
+`detonate_file` call:
+
+1. The **investigator LLM** is mid-conversation, working through the
+   masked input. It decides it needs to check a file and emits a tool
+   call: `detonate_file(file_reference=PATH_XXXX)`.
+2. LangGraph's ReAct loop intercepts that call, routes it through the
+   mask-aware wrapper (§5), unmasks the token, runs the real Hybrid
+   Analysis logic (§10), gets back a report, re-masks anything sensitive
+   in the result, and hands it back **into the same conversation** as a
+   `tool_result` message.
+3. **The same investigator LLM** reads that result — still the same agent
+   turn, same context, not a fresh call — and reasons about it: does this
+   verdict corroborate what `threat_intel_lookup` already found? Does the
+   C2-beacon behavior match an IP already seen in the log? It can call
+   more tools if it needs to, or move on to write its draft report,
+   weaving the sandbox finding in as one piece of evidence among several.
+4. Only **after** a complete draft report exists does a genuinely separate
+   LLM call happen: the **judge**, in its own fresh context. But the judge
+   doesn't re-read the raw Hybrid Analysis data — it evaluates the
+   investigator's *draft report as a whole* against its rubric (is every
+   claim traceable to a tool result, is the recommendation specific,
+   etc.). "You cited a malicious verdict but didn't say what behaviors
+   support it" is exactly the kind of thing that sends a draft back for
+   revision.
+
+So: one agent, one tool call, one continuous reasoning pass to synthesize
+the finding into the draft — then a second, independent LLM pass that
+reviews the finished draft, not the raw tool data itself.
 
 ### Judge loop
 
@@ -334,6 +414,15 @@ union the frontend switches on (see §9). Terminal events use the SSE
 `event:` field: `event: done` (stream complete) or `event: error` (an
 exception surfaced from the worker thread, with `{"message": "..."}` as
 the payload).
+
+**File uploads**: `_resolve_input()` writes the uploaded bytes to a
+server-side temp file (`tempfile.gettempdir()/asoc_investigator_uploads/`,
+UUID-prefixed, client filename reduced to its basename before use in a
+path) and puts that temp path into `raw_input` — the pipeline treats it
+exactly like a CLI-submitted local file (see §10, `detonate_file`). The
+temp file is deleted in `event_generator()`'s `finally` block once the
+investigation is fully done with it, whether it succeeded or errored. No
+file-size limit is enforced yet (see §12).
 
 ---
 
@@ -414,16 +503,93 @@ Handles 404 (no report), 429 (rate limited), and network errors per
 provider without raising — a failed lookup returns an `"error"` field
 under that provider's key rather than crashing the tool call.
 
-### `detonate_file` (`tools/sandbox.py`) — mocked
+### `detonate_file` (`tools/sandbox.py`) — real
+
+**What Hybrid Analysis (Falcon Sandbox) actually is**: a malware
+detonation service, conceptually distinct from `threat_intel_lookup`.
+Where VirusTotal/OTX are reputation *lookups* (has someone else already
+judged this indicator?), Hybrid Analysis **runs the file**. You give it a
+file; it actually executes it inside an isolated virtual machine (Windows,
+Linux, etc. — the `environment_id`) that's cut off from real networks and
+systems, so nothing it does can escape. While the file runs, the sandbox
+watches and records:
+
+- **Process behavior** — does it spawn child processes, inject code into
+  other processes?
+- **Filesystem changes** — does it drop new files, encrypt/delete things
+  (a ransomware signature)?
+- **Registry changes** — does it set itself to auto-run at startup
+  (persistence)?
+- **Network activity** — does it "phone home" to a C2 server, download a
+  second-stage payload?
+
+Alongside that it runs static checks too (multi-engine AV scan, similar to
+VirusTotal). After a few minutes it packages all of this into a report: an
+overall verdict, a threat score, and a list of specific observed behaviors
+(`persistence_via_registry_run_key`, `outbound_c2_beacon`, etc. — the
+exact shape the mock has always returned).
+
+**"Existing report" shortcut**: if that exact file (by hash) has already
+been analyzed by *anyone* before — Hybrid Analysis has a shared community
+database — you get that report back instantly, no waiting. That's why the
+tool checks `search/hash` first before submitting; only genuinely novel
+files trigger a fresh run (and the poll loop below).
+
+**Does it "investigate" for you?** — Only the behavioral-analysis piece,
+not the investigation. It answers "what does this specific file *do* when
+executed?" It doesn't know about the rest of the log, the other
+indicators, prior incidents, or what should actually be done about it —
+that synthesis is the investigator agent's job (see the worked example
+above). Hybrid Analysis runs the file and reports facts; the LLM figures
+out what those facts mean for *this* incident.
 
 **Args**: `file_reference` (str) — a masked token for a file path or hash.
 
-**What it does**: currently only a deterministic mock, shaped like a
-Hybrid Analysis / CAPE report (`verdict`, `threat_score`, `behaviors` e.g.
-`persistence_via_registry_run_key`, `outbound_c2_beacon`). Wiring a real
-provider is **not** a drop-in function swap like `threat_intel_lookup` was
-— real detonation is submit-then-poll (upload, wait, fetch report), not a
-single request/response, so it needs a poll loop added to the tool.
+**Mechanics**: classifies the unmasked value as a `hash` or a `path`
+(`_classify()`), then:
+
+- **`hash`** — existing-report lookup only (`GET /search/hash?hash=`).
+  There are no bytes to submit for a bare hash reference; if Hybrid
+  Analysis has no prior report, the tool returns an `"error"` explaining
+  why rather than fabricating a verdict.
+- **`path`** — reads the file from disk at that path, hashes it, and tries
+  the existing-report lookup first (cheap, avoids burning submission
+  quota on something already analyzed). On a miss, submits the file
+  (`POST /submit/file`, multipart, `environment_id=160` — Windows 10
+  64-bit by default) and polls `GET /report/{job_id}/state` every 10s for
+  up to 4 minutes. On `SUCCESS`, fetches `GET /report/{job_id}/summary`
+  and returns `verdict` (from `verdict_human`), `threat_score`, and
+  `behaviors` (`classification_tags`/`tags`). If still running after 4
+  minutes, returns a `"pending"` status with the `job_id` rather than
+  blocking indefinitely — real detonation can take longer than that.
+
+**Where the file bytes come from** — this is the part that needed real
+plumbing, not just an API swap:
+
+- **CLI** (`asoc-investigate --file <path>`) — the file is already local.
+  Its resolved absolute path is included as plain text in `raw_input`
+  (`cli.py`), gets masked like any other entity (matches the `FILE_PATH`
+  pattern → `PATH_XXXX` token), and `detonate_file` reads bytes straight
+  from that path after unmasking. No upload step needed — the tool and
+  the CLI process run on the same machine.
+- **Web app** — the frontend's file input sends real bytes via multipart
+  form to `/api/investigate/stream`. `api/app.py::_resolve_input` **saves
+  those bytes to a server-side temp file** (`tempfile.gettempdir() /
+  asoc_investigator_uploads/`, UUID-prefixed to avoid collisions, and the
+  client-supplied filename is stripped to its basename before being used
+  in the path — never trust a client filename as a path segment) and puts
+  that temp path into `raw_input` in exactly the same shape the CLI would
+  have. The rest of the pipeline can't tell the difference between "a
+  user's local file" and "a server-side temp copy of an upload" — same
+  masking, same tool, same code path. The temp file is deleted in the SSE
+  generator's `finally` block once the investigation (success or error) is
+  fully done with it — before that fix, uploaded bytes were read and then
+  silently discarded, so file uploads through the web app never actually
+  reached any tool.
+
+Falls back to a deterministic mock (shaped identically to the real
+`_format_summary()` output) when `HYBRID_ANALYSIS_API_KEY` isn't set —
+this is the only path actually exercised in development so far (see §11).
 
 ---
 
@@ -436,12 +602,12 @@ single request/response, so it needs a poll loop added to the tool.
 | LangGraph supervisor/investigator/judge wiring | Real |
 | Judge loop (max 3) | Real |
 | Threat intel (`threat_intel_lookup`) | **Real** — VirusTotal + AlienVault OTX; mock fallback if neither key is set. Only the mock path has actually been exercised in this environment so far — the live integration has been verified against the providers' documented API shapes, not live-tested with real keys. |
-| Sandbox (`detonate_file`) | Mocked — real integration needs a submit+poll loop, not just a swapped function |
+| Sandbox (`detonate_file`) | **Real** — Hybrid Analysis submit+poll+hash-search; mock fallback if `HYBRID_ANALYSIS_API_KEY` isn't set. Only the mock path and the offline logic (path/hash classification, missing-file handling) have actually been exercised here — the live submit/poll/summary flow hasn't been tested against a real key. |
+| File upload (web app) | **Real** — uploaded bytes are saved to a server-side temp file and cleaned up after the investigation completes, so `detonate_file` has real bytes to act on. Not yet exercised end-to-end here (needs a live `HYBRID_ANALYSIS_API_KEY` + a running frontend to actually drive an upload through). |
 | RAG store | Real Supabase/pgvector schema; degrades gracefully if unconfigured or if a query fails |
 | Embeddings | Real (OpenAI) automatically once `OPENAI_API_KEY` is set; hashing fallback otherwise |
 | Backend API (FastAPI) | Real — both endpoints verified to import/route correctly; the actual LLM round-trip through them hasn't been exercised in this environment (no live API keys here) |
 | Frontend | Real — typecheck/lint/build all verified; the live SSE round-trip against a running backend hasn't been exercised in this environment |
-| File upload / sandbox detonation | Mocked; a real integration would need file upload handling + async polling |
 
 ### Smoke tests (`scripts/`)
 
@@ -483,4 +649,12 @@ test those.
 - **Entity detection is regex-only.** Fine for the mocked/generated test
   logs; may need an NER model layered in once real logs are noisier and
   less regularly formatted than the samples in `lib/sampleLogs.ts`.
-- **Sandbox is the one tool not yet drop-in swappable** — see §10.
+- **No file-size limit on uploads.** `api/app.py::_resolve_input` reads the
+  entire upload into memory (`await file.read()`) and then writes it to a
+  server-side temp file — nothing currently caps how large that upload can
+  be, on either the frontend `<input type="file">` or the backend. Worth a
+  limit before this is exposed beyond localhost.
+- **`detonate_file`'s poll loop is a fixed 4-minute synchronous wait**
+  inside one tool call. Fine for a side project; a production version
+  would want the investigator to be able to move on and check back later
+  rather than blocking the whole investigation on one slow detonation.

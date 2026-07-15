@@ -55,10 +55,11 @@ def main() -> None:
         path = Path(args.input)
         if not path.exists():
             parser.error(f"File not found: {path}")
-        # v0.1 does not upload/detonate real file bytes — see
-        # docs/ARCHITECTURE.md "What's stubbed vs. real". We pass file
-        # metadata through the same masking + investigation pipeline so the
-        # sandbox tool has a file_reference to act on.
+        # The real local path flows through masking as ordinary text (it
+        # gets tokenized like any other entity) — tools/sandbox.py reads
+        # bytes directly from this path after unmasking, so real
+        # detonation works for CLI-submitted files with no separate
+        # upload step needed.
         raw_input = (
             f"File submitted for analysis: {path.name}\n"
             f"Path: {path.resolve()}\n"
