@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { SAMPLE_LOG_GENERATORS } from "@/lib/sampleLogs";
 import type { InvestigationParams } from "@/lib/types";
 
 interface Props {
@@ -53,14 +54,30 @@ export default function InvestigationForm({ isRunning, onSubmit }: Props) {
       </div>
 
       {mode === "log" ? (
-        <textarea
-          value={logText}
-          onChange={(e) => setLogText(e.target.value)}
-          disabled={isRunning}
-          rows={6}
-          placeholder={'Failed login for CORP\\alice from 203.0.113.7 to WKSTN-042. Outbound connection to evil-c2.example.com (203.0.113.7).'}
-          className="w-full rounded-md border border-black/15 dark:border-white/20 bg-transparent p-2 font-mono text-sm"
-        />
+        <div className="flex flex-col gap-2">
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <span className="text-black/60 dark:text-white/60">Generate sample:</span>
+            {SAMPLE_LOG_GENERATORS.map((gen) => (
+              <button
+                key={gen.label}
+                type="button"
+                disabled={isRunning}
+                onClick={() => setLogText(gen.generate())}
+                className="rounded-full border border-black/15 dark:border-white/20 px-2.5 py-1 hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-40"
+              >
+                {gen.label}
+              </button>
+            ))}
+          </div>
+          <textarea
+            value={logText}
+            onChange={(e) => setLogText(e.target.value)}
+            disabled={isRunning}
+            rows={8}
+            placeholder={'Failed login for CORP\\alice from 203.0.113.7 to WKSTN-042. Outbound connection to evil-c2.example.com (203.0.113.7).\n\nOr click a "Generate sample" button above.'}
+            className="w-full rounded-md border border-black/15 dark:border-white/20 bg-transparent p-2 font-mono text-sm"
+          />
+        </div>
       ) : (
         <input
           type="file"

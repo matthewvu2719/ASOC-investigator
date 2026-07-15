@@ -203,3 +203,11 @@ second tool/provider for data the first call already returns).
   cross investigation/tenant boundaries).
 - Whether entity detection needs an NER model in addition to regex once
   real logs are noisier than the mocked examples.
+- **`RAGStore.upsert_incident` is never called.** The graph doesn't persist
+  finished investigations back into the RAG store, so "checks for similar
+  prior incidents" only ever finds whatever was seeded manually — the
+  corpus doesn't grow from the app's own use. Wiring this in means picking
+  policy questions that shouldn't be guessed at: should `needs_review`
+  investigations be persisted at all, or only judge-satisfied ones? Should
+  there be a confidence floor? A dedicated node after `finalize`, or inline
+  in it? Answer these before adding the call site.

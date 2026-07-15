@@ -11,12 +11,15 @@ exercised without a live Supabase project.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 
 from supabase import Client, create_client
 
 from .embeddings import Embedder, get_embedder
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -48,16 +51,28 @@ class RAGStore:
 
     def search(self, masked_query_text: str, top_k: int = 5) -> list[IncidentHit]:
         """Find prior incidents similar to the current (already-masked)
-        input. Returns [] if Supabase isn't configured — callers should
-        treat that as "no prior-incident context available", not an error."""
+        input. Returns [] both when Supabase isn't configured AND when a
+        configured lookup fails (missing schema, network error, rate
+        limit, ...) — RAG is enrichment, not a hard dependency, so a
+        failure here must not take down the whole investigation. Callers
+        should treat [] as "no prior-incident context available"."""
         if self._client is None:
             return []
 
-        embedding = self.embedder.embed(masked_query_text)
-        response = self._client.rpc(
-            "match_incidents",
-            {"query_embedding": embedding, "match_count": top_k},
-        ).execute()
+        try:
+            embedding = self.embedder.embed(masked_query_text)
+            response = self._client.rpc(
+                "match_incidents",
+                {"query_embedding": embedding, "match_count": top_k},
+            ).execute()
+        except Exception:
+            logger.warning(
+                "RAG lookup failed — continuing without prior-incident context. "
+                "If this persists, confirm rag/schema.sql has been run against "
+                "your Supabase project.",
+                exc_info=True,
+            )
+            return []
 
         return [
             IncidentHit(
@@ -79,17 +94,26 @@ class RAGStore:
         confidence: float | None,
     ) -> None:
         """Persist a finalized (masked) investigation so future
-        investigations can retrieve it. No-op if Supabase isn't configured."""
+        investigations can retrieve it. No-op if Supabase isn't configured;
+        logs and swallows the error if a configured write fails, for the
+        same reason as `search` — this must not crash the caller.
+
+        NOTE: nothing in the graph calls this yet (see
+        docs/ARCHITECTURE.md) — investigations aren't currently persisted
+        back into the RAG store after they finish."""
         if self._client is None:
             return
 
-        embedding = self.embedder.embed(masked_summary)
-        self._client.table("incidents").insert(
-            {
-                "masked_summary": masked_summary,
-                "indicator_types": indicator_types,
-                "resolution": resolution,
-                "confidence": confidence,
-                "embedding": embedding,
-            }
-        ).execute()
+        try:
+            embedding = self.embedder.embed(masked_summary)
+            self._client.table("incidents").insert(
+                {
+                    "masked_summary": masked_summary,
+                    "indicator_types": indicator_types,
+                    "resolution": resolution,
+                    "confidence": confidence,
+                    "embedding": embedding,
+                }
+            ).execute()
+        except Exception:
+            logger.warning("Failed to persist incident to RAG store.", exc_info=True)
