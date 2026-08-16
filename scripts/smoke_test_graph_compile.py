@@ -18,4 +18,20 @@ if __name__ == "__main__":
     app = build_graph(investigator_model="gpt-4.1", judge_model="gpt-4.1", max_iterations=3)
     print("Graph compiled OK.")
     print()
-    print("Nodes:", list(app.get_graph().nodes.keys()))
+    nodes = list(app.get_graph().nodes.keys())
+    print("Nodes:", nodes)
+
+    expected = {
+        "__start__",
+        "ingest_and_mask",
+        "supervisor",
+        "investigator",
+        "correlation",
+        "remediation",
+        "judge",
+        "finalize",
+        "__end__",
+    }
+    missing = expected - set(nodes)
+    assert not missing, f"expected nodes missing from compiled graph: {missing}"
+    print("OK: supervisor + all three specialist agents wired in")

@@ -4,25 +4,30 @@
 
 Give it a security log excerpt or a suspicious file. It:
 
-1. **Checks for similar prior incidents** — retrieves masked write-ups of
-   past investigations from a vector store (RAG), so the investigator has
-   pattern context before it starts.
-2. **Investigates the indicators** — a ReAct agent pulls out IPs, domains,
-   URLs, hashes, hostnames, etc. and calls tools to enrich them: threat
-   intelligence (reputation, geolocation, campaign attribution) and sandbox
-   detonation for files.
-3. **Never lets an LLM see real PII** — every identifier is replaced with a
+1. **Orchestrates specialist agents** — a supervisor agent decides which
+   of three specialists to dispatch, in what order, based on what's
+   already been found: an **investigator** (pulls out IPs, domains, URLs,
+   hashes, hostnames, etc. and enriches them via threat intelligence and
+   sandbox detonation), a **correlation** agent (checks prior similar
+   incidents via RAG and maps observed behaviors to MITRE ATT&CK
+   techniques), and a **remediation** agent (proposes containment actions
+   — mocked, never auto-executed).
+2. **Never lets an LLM see real PII** — every identifier is replaced with a
    reversible token before it reaches any model. Real values exist only for
    the instant it takes to call a real provider API, inside code the app
    controls — never in a prompt, never in a response a model reads back.
-4. **Reviews its own output** — a separate LLM call (the "judge") scores
-   the investigator's draft against a rubric and can send it back for
-   revision, up to 3 times.
-5. **Returns a report with a confidence level**, unmasked, flagged for
+3. **Reviews its own output** — a separate LLM call (the "judge" — a
+   single evaluator call, not an agent) scores the combined report against
+   a rubric and can send it back to the supervisor for revision, targeting
+   the specific specialist whose section needs work, up to 3 times.
+4. **Returns a report with a confidence level**, unmasked, flagged for
    human review if the judge wasn't satisfied within the loop budget.
 
 It's usable two ways: a CLI (`asoc-investigate`) and a web app (FastAPI
 backend + Next.js frontend with live streaming progress).
+
+See also [AGENT_ARCHITECTURE.md](AGENT_ARCHITECTURE.md) for the condensed
+"what did we build and why" version of the agent/workflow design.
 
 ---
 
@@ -57,18 +62,30 @@ backend + Next.js frontend with live streaming progress).
                                                 │                           │
                                                 │  ingest_and_mask          │
                                                 │       │                   │
-                                                │  rag_retrieve ───────────┼──▶ Supabase / pgvector
-                                                │       │                   │
-                                                │  investigator (ReAct) ───┼──▶ VirusTotal
-                                                │       │       │           │  ▶ AlienVault OTX
-                                                │       │       └──────────┼──▶ Hybrid Analysis (sandbox)
                                                 │       ▼                   │
-                                                │     judge                 │
-                                                │       │  (loop, max 3)    │
-                                                │       ▼                   │
-                                                │    finalize                │
+                                                │  supervisor (LLM router) ◀┼─────────────┐
+                                                │       │                   │             │
+                                                │   ┌───┼──────────┬────────┤             │ loop
+                                                │   ▼   ▼          ▼        │             │ (revision,
+                                                │ investigator correlation remediation     │  targeted
+                                                │   │     │        │        │             │  by judge)
+                                                │   │     └─▶Supabase/pgvector             │
+                                                │   ├─▶VirusTotal │        │             │
+                                                │   ├─▶AlienVault OTX      │             │
+                                                │   └─▶Hybrid Analysis     │             │
+                                                │   └─────┴────────┴───────┘             │
+                                                │       │  (back to supervisor)          │
+                                                │       ▼                                 │
+                                                │     judge ──────────────────────────────┘
+                                                │       │  (satisfied, or budget exhausted)
+                                                │       ▼
+                                                │    finalize
                                                 └──────────────────────────┘
 ```
+
+The supervisor is a genuine LLM decision (structured output, not a fixed
+`if/else`) — it decides which specialist to dispatch next, or that there's
+enough evidence for the judge to review. See §7.
 
 The CLI (`cli.py`) calls the same `graph.build_graph()` / `run_investigation()`
 directly — it doesn't go through the API. The API exists only for the web
@@ -83,23 +100,32 @@ src/asoc_investigator/
     engine.py         # MaskingEngine — the reversible token vault
   tools/
     base.py           # ToolSpec + the mask-aware wrapper (the safety boundary)
-    threat_intel.py   # threat_intel_lookup — real VirusTotal + OTX, mock fallback
-    sandbox.py         # detonate_file — real Hybrid Analysis (submit+poll), mock fallback
-    registry.py         # binds ToolSpecs to one investigation's MaskingEngine
+    threat_intel.py   # threat_intel_lookup — real VirusTotal + OTX, mock fallback (investigator)
+    sandbox.py         # detonate_file — real Hybrid Analysis (submit+poll), mock fallback (investigator)
+    correlation.py       # mitre_attack_lookup + search_prior_incidents (correlation agent)
+    remediation.py         # propose_firewall_block — deliberately MOCK (remediation agent)
+    registry.py               # binds the investigator's ToolSpecs to one investigation's MaskingEngine
   rag/
     embeddings.py       # Embedder protocol: OpenAIEmbedder (real) / HashingEmbedder (fallback)
     store.py             # RAGStore — Supabase/pgvector wrapper, degrades gracefully
     schema.sql             # incidents table + match_incidents() function — run once per Supabase project
   agents/
-    investigator.py         # ReAct agent (OpenAI), bound to the tools
-    judge.py                  # LLM-as-judge, structured output, separate context
-    supervisor.py               # deterministic loop-control router (not an LLM call)
+    investigator.py         # ReAct specialist — threat intel + sandbox tools
+    correlation.py            # ReAct specialist — RAG search + MITRE ATT&CK mapping
+    remediation.py               # ReAct specialist — proposes (mock) containment actions
+    judge.py                       # LLM-as-judge — single structured-output call, not an agent
+    supervisor.py                    # LLM router — decides which specialist runs next, or "judge"
+    _common.py                         # shared revision-continuation helpers for the 3 specialists
+  report.py                            # combine_report() — stitches the specialists' reports together
   graph/
-    state.py                      # InvestigationState TypedDict — the shared state schema
-    build.py                        # wires nodes + edges into a compiled graph
+    build.py                      # wires nodes + edges into a compiled graph
   api/
     app.py                           # FastAPI app: /api/investigate, /api/investigate/stream, /api/health
     streaming.py                      # bridges LangGraph's sync .stream() onto a background thread for SSE
+  state.py                            # InvestigationState TypedDict — top-level, not inside graph/
+                                       # (agents/*.py need it too; graph/build.py imports agents/*,
+                                       # so this used to live in graph/state.py and created a real
+                                       # circular import — see "Agents" below)
   cli.py                              # `asoc-investigate` entry point
 
 frontend/
@@ -125,24 +151,34 @@ scripts/                                              # smoke tests — see §11
 ```
 input (log text | file)
   -> ingest_and_mask   (build a per-investigation MaskingEngine, mask the raw input)
-  -> rag_retrieve       (embed the masked input, query Supabase/pgvector for similar prior incidents)
-  -> investigator        (ReAct agent; tool calls go through the mask-aware executor)
-       -> draft report (masked)
-  -> judge                 (evaluates draft against a rubric)
+  -> supervisor          (LLM router: decides which specialist to dispatch, or "judge")
+       -> investigator     (ReAct; threat-intel + sandbox tools) ─┐
+       -> correlation        (ReAct; RAG search + ATT&CK mapping)  ├─> back to supervisor
+       -> remediation           (ReAct; mock containment proposal)─┘    (repeat until
+                                                                          supervisor decides
+                                                                          "judge", bounded by
+                                                                          max_agent_steps)
+  -> judge                 (single evaluator call — not an agent — scores the combined
+       |                    report against a rubric, names which specialist needs redoing)
        -> satisfied?            -> finalize
-       -> needs_revision?       -> back to investigator, with feedback (max 3 loops total)
+       -> needs_revision?       -> back to supervisor, which routes directly to the named
+       |                          specialist (max_iterations judge loops total)
        -> max_iterations hit?   -> finalize anyway, flagged for review
   -> finalize                     (unmask — the ONLY point plaintext PII re-enters
                                     anything outside the tool-execution boundary)
   -> render (report + confidence + review flag)
 ```
 
-State is one `InvestigationState` `TypedDict` (`graph/state.py`) threaded through
+State is one `InvestigationState` `TypedDict` (`state.py`) threaded through
 every node: `raw_input`, `masking_engine`, `masked_input`, `prior_incidents`,
-`draft_report`, `judge_verdicts`, `iteration`, `final_report`, `confidence`,
-`needs_review`, `review_note`. `masking_engine` and `investigator_messages`
-are process-internal only — the API layer strips them before anything crosses
-the HTTP boundary (see §8).
+`investigator_report`/`correlation_report`/`remediation_report` (each
+specialist's own output — `report.py::combine_report()` stitches them into
+one document for the judge and for finalize), `agents_completed`,
+`agent_steps`, `supervisor_decision`, `judge_verdicts`, `iteration`,
+`final_report`, `confidence`, `needs_review`, `review_note`.
+`masking_engine` and every `*_messages` field (each specialist's own
+conversation history) are process-internal only — the API layer strips
+them before anything crosses the HTTP boundary (see §8).
 
 ---
 
@@ -195,7 +231,17 @@ Concretely:
   "before call / after call" hook to do this substitution, and a
   third-party MCP server would either receive a token it can't resolve, or
   require unmasking before the call anyway — at which point you've
-  rebuilt this wrapper behind an extra protocol hop for no gain.
+  rebuilt this wrapper behind an extra protocol hop for no gain. The call
+  to `spec.impl(...)` is wrapped in a broad `try/except Exception` — any
+  unexpected failure (a malformed-but-200 API response, a `JSONDecodeError`
+  deep in a provider call, anything an individual tool didn't anticipate)
+  returns a graceful tool-error string instead of crashing the whole graph
+  invocation. This is the shared boundary for every tool, current and
+  future, so fixing it once here protects all of them — individual tool
+  implementations (`threat_intel.py`, `sandbox.py`) still have their own
+  narrower `try/except httpx.HTTPError` blocks for expected failure modes
+  (rate limits, timeouts), but this outer catch is the backstop for
+  whatever those don't anticipate.
 - The vault is scoped to one investigation and discarded after
   unmask-at-finalize (persistence/expiry policy for resumable
   investigations is an open question — see §12). It is never stored in the
@@ -213,6 +259,17 @@ Prior incident write-ups are stored **already masked** — they're the
 output of this same pipeline — so retrieval never touches the vault: embed
 the masked current-input text, query Supabase/pgvector for nearest
 neighbors, return masked incident summaries directly into context.
+
+Retrieval used to be its own eager graph node that ran unconditionally
+before the investigator. It now lives inside the **correlation agent**
+(`agents/correlation.py`) instead: an eager search still runs at the start
+of that agent's turn (same query shape as before — the masked input text),
+but the agent also has a `search_prior_incidents` tool
+(`tools/correlation.py`) for a follow-up, more targeted query if the
+initial retrieval wasn't specific enough. The practical difference is that
+RAG lookup is now something the **supervisor decides is worth doing** (it
+can skip correlation entirely for a clearly benign, isolated finding)
+rather than a fixed step every investigation pays for regardless of need.
 
 - **Store**: Supabase Postgres + `pgvector`. One table (`incidents`)
   holding masked summary text, an embedding vector, indicator types, and
@@ -242,96 +299,145 @@ neighbors, return masked incident summaries directly into context.
 
 ## 7. Agents
 
-Built with LangGraph, not a hand-rolled loop. Investigator and judge are
-independent model parameters — currently both default to OpenAI.
+Built with LangGraph, not a hand-rolled loop. Five roles, all independent
+model parameters, currently all defaulting to OpenAI. Only four of them
+are genuinely "agents" in the sense of exercising autonomy over what to do
+next — the judge is a single evaluator call, deliberately not inflated
+into an agent it isn't. See docs/AGENT_ARCHITECTURE.md for the condensed
+version of this reasoning.
 
-- **Supervisor** (`agents/supervisor.py`, `route_after_judge`) — a thin
-  deterministic router, **not an LLM call**. Reads the judge's last
-  verdict and the iteration counter to decide "back to investigator" vs
-  "finalize." Holds the max-3-loops budget.
+- **Supervisor** (`agents/supervisor.py`, `build_supervisor` /
+  `route_after_supervisor`) — an **LLM router**, not a fixed `if/else`.
+  Given what's already been produced this pass (`agents_completed`) and,
+  on a revision pass, the judge's feedback, it decides which specialist to
+  dispatch next — `investigator`, `correlation`, or `remediation` — or
+  that there's enough evidence for `judge` to review. This is a real
+  decision: the supervisor can skip correlation entirely for a clearly
+  benign finding, or skip remediation when nothing warrants action, rather
+  than every investigation paying for every specialist regardless of need.
+  Two guardrails keep an LLM-driven router from being a reliability risk:
+  a **structural validation pass** after the LLM call enforces the
+  invariants that actually matter (investigator must run before
+  correlation/remediation; don't re-run an already-completed agent unless
+  a revision explicitly targets it) — the LLM proposes, code enforces —
+  and a **`max_agent_steps` budget**, independent of the judge's own
+  `max_iterations`, caps total specialist dispatches so a router that
+  keeps deciding "not ready yet" can't thrash indefinitely. When the judge
+  returns `needs_revision` with a `target_agent`, the supervisor honors it
+  directly (no LLM call needed — the judge already decided) and tracks
+  `revision_target_handled_at` so it doesn't re-dispatch the same target
+  forever while waiting for the judge to re-evaluate.
 - **Investigator** (`agents/investigator.py`) — a **ReAct** agent
   (`langgraph.prebuilt.create_react_agent`) on OpenAI (`ChatOpenAI`,
-  default `gpt-4.1`), bound to the mask-aware tools (§10). "ReAct"
-  (Reason + Act) is the standard tool-use agent pattern: the LLM
+  default `gpt-4.1`), bound to the threat-intel and sandbox tools (§10).
+  "ReAct" (Reason + Act) is the standard tool-use agent pattern: the LLM
   alternates between reasoning about what it needs next and emitting a
   tool call, reads the tool's result back into the *same* conversation,
   reasons about that, and repeats — calling more tools or stopping to
   produce a final answer — until it decides it has enough to answer
   without another tool call. `create_react_agent` implements exactly this
-  loop; nothing about it is bespoke to this project. System prompt
-  explicitly tells it the input is masked and instructs it never to try to
-  guess/reconstruct real values — that's by design, not a limitation to
-  work around. Produces a draft report: summary, per-indicator findings
-  (each citing the tool result that supports it), prior-incident pattern
-  match, verdict + recommendation, confidence + justification. On a
-  revision pass, prior judge feedback is appended to the user turn.
-- **Judge** (`agents/judge.py`) — a separate LLM call with its **own fresh
-  context** (not the investigator's conversation), so it can't rubber-stamp
-  its own prior reasoning. Currently OpenAI as well (`ChatOpenAI`, default
-  `gpt-4.1`) — a deliberate, **temporary** tradeoff: a cross-provider judge
-  (e.g. Gemini) is a genuinely stronger independence check, since a
-  same-family judge tends to share the author model's blind spots, but a
-  free-tier Gemini key rate-limits exactly when iterating fastest during
-  development. Revisit once the pipeline is stable — swapping is one
-  import + one default string in `agents/judge.py`
+  loop; nothing about it is bespoke to this project. Always dispatched
+  first by the supervisor, since correlation and remediation both depend
+  on its findings. Produces `investigator_report`: summary, per-indicator
+  findings (each citing the tool result that supports it), verdict +
+  recommendation, confidence + justification.
+- **Correlation** (`agents/correlation.py`) — a ReAct agent bound to
+  `search_prior_incidents` and `mitre_attack_lookup` (§10, §6). Widens the
+  investigator's per-indicator findings into broader context: how closely
+  this matches prior incidents, and which MITRE ATT&CK techniques the
+  observed behaviors map to. Dispatched by the supervisor when the
+  investigator's findings are ambiguous or actionable enough to be worth
+  the extra context; skippable for a clearly benign, isolated finding.
+- **Remediation** (`agents/remediation.py`) — a ReAct agent bound to
+  `propose_firewall_block` (§10). Decides whether containment is actually
+  warranted given the investigator's (and correlation's, if it ran)
+  findings, and if so, proposes a specific action. The tool is
+  **deliberately mocked** — it never blocks anything for real, and every
+  proposal is explicitly marked as requiring human approval. This is the
+  one specialist whose real-world equivalent would be a genuinely
+  high-blast-radius autonomous action, so the scope here is
+  "recommend, don't auto-execute" rather than a live integration or an
+  approval-workflow UI (see §12).
+- **Judge** (`agents/judge.py`) — a **single structured-output LLM call**,
+  not an agent: no tools, no loop, no autonomy over what happens next. Its
+  own fresh context (not any specialist's conversation), so it can't
+  rubber-stamp prior reasoning. Currently OpenAI as well (`ChatOpenAI`,
+  default `gpt-4.1`) — a deliberate, **temporary** tradeoff: a
+  cross-provider judge (e.g. Gemini) is a genuinely stronger independence
+  check, since a same-family judge tends to share the author model's blind
+  spots, but a free-tier Gemini key rate-limits exactly when iterating
+  fastest during development. Revisit once the pipeline is stable —
+  swapping is one import + one default string in `agents/judge.py`
   (`langchain_google_genai` is already installed for this). Scores the
-  draft against a rubric — **grounding** (every claim traceable to a tool
-  result or RAG hit), **completeness** (every investigated indicator
-  addressed), **actionability** (a specific recommendation, not a hedge),
-  **calibration** (stated confidence matches evidence quality) — and
-  returns structured output (Pydantic → `with_structured_output`):
-  `verdict` (`satisfied`/`needs_revision`), `confidence` (0–1), `feedback`.
+  **combined** report (`report.py::combine_report()` — investigator +
+  correlation + remediation sections stitched together) against a rubric —
+  **grounding**, **completeness**, **actionability**, **calibration** (see
+  `JUDGE_SYSTEM_PROMPT` for the full rubric text) — and returns structured
+  output (Pydantic → `with_structured_output`): `verdict`
+  (`satisfied`/`needs_revision`), `target_agent`
+  (`investigator`/`correlation`/`remediation`/`null` — which specialist's
+  section is actually deficient, so the supervisor can route the revision
+  directly instead of guessing from prose), `confidence` (0–1), `feedback`.
+  **Grounding is checked against the raw tool results from all three
+  specialists**, not just their prose — `_format_tool_evidence` extracts
+  every `ToolMessage` from `investigator_messages`, `correlation_messages`,
+  and `remediation_messages` and includes the actual tool output alongside
+  the draft, so the judge can catch a claim that doesn't match what a tool
+  actually returned.
 
-Both model IDs are independent parameters everywhere: `build_graph(
-investigator_model=..., judge_model=...)`, `--investigator-model` /
-`--judge-model` on the CLI, `investigator_model` / `judge_model` fields on
-the API request bodies.
+All five model IDs are independent parameters on `build_graph()` /
+`run_investigation()` (`investigator_model`, `correlation_model`,
+`remediation_model`, `supervisor_model`, `judge_model`). Only
+`investigator_model` and `judge_model` are exposed as CLI flags / API
+request fields today — the others default to `gpt-4.1` and are swappable
+at the Python level; wiring them through the CLI/API surface is a small,
+deferred addition, not a design limitation.
 
 ### Why ReAct here, not a fixed pipeline
 
-Worth being honest that ReAct isn't the only option, and is arguably more
-than the current tool set strictly needs — it's a real tradeoff, not an
-obvious choice.
+Worth being honest that ReAct isn't the only option for the specialists —
+it's a real tradeoff, not an obvious choice.
 
-**What it buys**: the investigator only ever sees opaque masked tokens
+**What it buys**: each specialist only ever sees opaque masked tokens
 (`IP_A3F9`, `DOMAIN_1FA9`, ...) with no way to know in advance which
 represent real signal vs. noise — an internal `10.0.5.23` isn't worth a
 VirusTotal call; an external IP probably is. A ReAct agent can exercise
 judgment about *which* indicators are worth investigating and in what
 order, rather than blindly checking every single one — which matters
 given VirusTotal's free tier is 4 requests/minute, so naively checking
-every token in a busy log would burn through quota fast. It also means
-future conditional logic ("if OTX flags a specific campaign, dig into it
-further") is just a prompt change, not a rewrite.
+every token in a busy log would burn through quota fast. The same
+reasoning now applies one level up: the **supervisor** exercises judgment
+about which *specialists* are worth dispatching at all, for the same
+reason — not every investigation needs correlation or remediation.
 
-**The honest alternative**: with only two tools, and a token list the
-masking engine already hands you cleanly typed
-(`engine.known_tokens()`, `entity_type_of()`), this could instead be a
-fully deterministic pipeline — loop over every known token by type, call
-the matching tool on each in plain code, then a single LLM call at the end
-to synthesize a report from all the masked results. That would be more
-predictable, cheaper (no reasoning overhead, no risk of the model skipping
-something it shouldn't), and easier to test than an agent loop.
+**The honest alternative**: with a handful of tools per specialist, and a
+token list the masking engine already hands you cleanly typed
+(`engine.known_tokens()`, `entity_type_of()`), each specialist's job could
+instead be a fully deterministic pipeline — loop over relevant tokens by
+type, call the matching tool on each in plain code, then a single LLM call
+to synthesize a report. That would be more predictable, cheaper (no
+reasoning overhead), and easier to test than an agent loop, and the
+supervisor's routing could similarly be the deterministic function it used
+to be instead of an LLM call.
 
-**When each is the right call**: ReAct earns its complexity if the tool
-surface and investigation logic keep growing and relevance judgment stays
-valuable. **This is the actual reason it's kept here** — the plan is to
-extend the investigator with more tools over time, at which point
-"decide which of N tools are relevant, in what order, and whether a result
-warrants a follow-up call" stops being optional and becomes exactly the
-problem ReAct solves. For today's 2-tool set alone it would be defensible
-to call this over-engineered; it stops being over-engineered the moment a
-third or fourth tool shows up and the deterministic "call everything"
-pipeline would otherwise need hand-written branching logic to decide what
-to skip and what to chain.
+**When each is the right call**: ReAct (and now, LLM-driven supervision)
+earns its complexity if the tool surface and investigation logic keep
+growing and relevance judgment stays valuable. **This is the actual reason
+it's used here** — with three specialists and a supervisor deciding
+between them, "decide which agents are relevant, in what order, and
+whether a result warrants a follow-up call" stops being optional. For a
+single fixed tool sequence it would be defensible to call this
+over-engineered; it stops being over-engineered once the decision of "is
+this specialist even worth running" has a real, varying answer per
+investigation.
 
 ### Worked example: a tool call, end to end
 
-It's easy to conflate "the investigator calls a tool" with "an LLM
-evaluates the tool's result" as two separate model calls. They aren't —
-it's one continuous reasoning loop, with a genuinely separate model call
-only happening afterward, over the finished draft. Concretely, for a
-`detonate_file` call:
+It's easy to conflate "an agent calls a tool" with "an LLM evaluates the
+tool's result" as two separate model calls. Within one specialist's turn
+they aren't — it's one continuous reasoning loop. Genuinely separate model
+calls only happen at the supervisor (deciding what runs next) and the
+judge (reviewing what's finished). Concretely, for a `detonate_file` call:
 
 1. The **investigator LLM** is mid-conversation, working through the
    masked input. It decides it needs to check a file and emits a tool
@@ -342,41 +448,62 @@ only happening afterward, over the finished draft. Concretely, for a
    in the result, and hands it back **into the same conversation** as a
    `tool_result` message.
 3. **The same investigator LLM** reads that result — still the same agent
-   turn, same context, not a fresh call — and reasons about it: does this
-   verdict corroborate what `threat_intel_lookup` already found? Does the
-   C2-beacon behavior match an IP already seen in the log? It can call
-   more tools if it needs to, or move on to write its draft report,
-   weaving the sandbox finding in as one piece of evidence among several.
-4. Only **after** a complete draft report exists does a genuinely separate
-   LLM call happen: the **judge**, in its own fresh context. But the judge
-   doesn't re-read the raw Hybrid Analysis data — it evaluates the
-   investigator's *draft report as a whole* against its rubric (is every
-   claim traceable to a tool result, is the recommendation specific,
-   etc.). "You cited a malicious verdict but didn't say what behaviors
-   support it" is exactly the kind of thing that sends a draft back for
-   revision.
+   turn, same context, not a fresh call — and reasons about it, calls more
+   tools if needed, or moves on to write `investigator_report`.
+4. The investigator node returns to the **supervisor**, which — a genuine,
+   separate LLM decision — decides whether correlation or remediation are
+   worth dispatching, or whether there's enough for the judge already.
+5. If dispatched, **correlation** reads the investigator's report, checks
+   prior incidents, and can call `mitre_attack_lookup` on any behavior
+   tags the sandbox result surfaced (e.g. `outbound_c2_beacon`), producing
+   `correlation_report`. The supervisor decides again — often "judge" from
+   here, or "remediation" if the findings warrant containment.
+6. Only once the supervisor decides "judge" does the **judge** — a
+   genuinely separate LLM call, own fresh context — evaluate the combined
+   report against its rubric, with the **raw Hybrid Analysis result**
+   (and every other tool result from every specialist that ran) alongside
+   it, so it can check whether a claim actually matches what a tool
+   returned. "You cited a malicious verdict but the tool result says
+   suspicious, not malicious" is exactly what this catches.
+7. If the verdict is `needs_revision` with `target_agent="investigator"`,
+   the supervisor routes directly back to the investigator — which reuses
+   its full message history from steps 1–3 (including the `detonate_file`
+   result) and appends the judge's feedback as a new turn, rather than
+   starting over. If the target were `"correlation"` instead, the
+   investigator wouldn't run again at all — the supervisor would dispatch
+   correlation directly.
 
-So: one agent, one tool call, one continuous reasoning pass to synthesize
-the finding into the draft — then a second, independent LLM pass that
-reviews the finished draft, not the raw tool data itself.
+So: three specialists, each a continuous ReAct reasoning loop internally —
+orchestrated by a supervisor that decides which ones are worth running and
+in what order — reviewed by an independent judge that can see all their
+raw tool evidence — and, if sent back, routed to exactly the specialist
+that needs to redo its part, which continues rather than restarts.
 
-### Judge loop
+### Judge / supervisor loop
 
 ```
+agent_steps = 0
+loop:                                        # supervisor's own loop
+  next = supervisor.decide(state)            # sees agents_completed, prior judge feedback
+  if next == "judge": break
+  run(next)                                  # investigator / correlation / remediation
+  agent_steps += 1
+  if agent_steps >= max_agent_steps: break    # hard cap, independent of the judge's budget
+
 iteration = 0
-loop:
-  draft = investigator.run(state)          # sees prior judge feedback, if any
-  verdict = judge.evaluate(draft)
+loop:                                        # judge's own loop
+  verdict = judge.evaluate(combine_report(state))
   iteration += 1
   if verdict.verdict == "satisfied": break
-  if iteration >= max_iterations: break     # exhausted budget, not necessarily satisfied
-  # loop back to investigator with verdict.feedback in context
+  if iteration >= max_iterations: break       # exhausted budget, not necessarily satisfied
+  # supervisor routes directly to verdict.target_agent, then re-enters the
+  # supervisor loop above (bounded by the same max_agent_steps)
 ```
 
 Final display: judge satisfied within budget → report + confidence, no
-flag. Budget exhausted without satisfaction → report + confidence **+
-"needs human review"**, with the judge's last feedback attached so a
-reviewer knows what it flagged.
+flag. Budget exhausted (either loop) without satisfaction → report +
+confidence **+ "needs human review"**, with the judge's last feedback
+attached so a reviewer knows what it flagged.
 
 ---
 
@@ -402,18 +529,19 @@ requests.
 
 **What crosses the API boundary**: `_serialize_update()` /
 `_public_result()` in `api/app.py` strip `masking_engine` (never
-serializable — it's the vault) and `investigator_messages` (raw LangChain
-message objects) from every response. `prior_incidents` (a list of
-`IncidentHit` dataclasses) gets `dataclasses.asdict()`'d. Everything else
-in `InvestigationState` is already JSON-safe.
+serializable — it's the vault) and every specialist's `*_messages` field
+(`investigator_messages`, `correlation_messages`, `remediation_messages` —
+raw LangChain message objects) from every response. `prior_incidents` (a
+list of `IncidentHit` dataclasses) gets `dataclasses.asdict()`'d.
+Everything else in `InvestigationState` is already JSON-safe.
 
 **SSE event shape**: each `data:` line is `{node_name: partial_state}` for
-whichever node just completed (`ingest_and_mask`, `rag_retrieve`,
-`investigator`, `judge`, or `finalize`) — a discriminated-by-key-presence
-union the frontend switches on (see §9). Terminal events use the SSE
-`event:` field: `event: done` (stream complete) or `event: error` (an
-exception surfaced from the worker thread, with `{"message": "..."}` as
-the payload).
+whichever node just completed (`ingest_and_mask`, `supervisor`,
+`investigator`, `correlation`, `remediation`, `judge`, or `finalize`) — a
+discriminated-by-key-presence union the frontend switches on (see §9).
+Terminal events use the SSE `event:` field: `event: done` (stream
+complete) or `event: error` (an exception surfaced from the worker
+thread, with `{"message": "..."}` as the payload).
 
 **File uploads**: `_resolve_input()` writes the uploaded bytes to a
 server-side temp file (`tempfile.gettempdir()/asoc_investigator_uploads/`,
@@ -591,6 +719,48 @@ Falls back to a deterministic mock (shaped identically to the real
 `_format_summary()` output) when `HYBRID_ANALYSIS_API_KEY` isn't set —
 this is the only path actually exercised in development so far (see §11).
 
+### `mitre_attack_lookup` (`tools/correlation.py`) — real, curated data
+
+**Args**: `behavior_tags` (list of str) — behavior/category tags as
+returned by `threat_intel_lookup` or `detonate_file` (e.g.
+`outbound_c2_beacon`, `c2`, `persistence_via_registry_run_key`).
+
+**What it does**: matches each tag against a small local table
+(`_MITRE_TAG_MAP`) of real ATT&CK technique IDs, names, and tactics.
+**Honest scope note**: this is curated tag-matching against the exact
+vocabulary this project's own tools produce, not a live pull from MITRE's
+TAXII/STIX feed — the technique IDs and names are real and current, but
+the *mapping* is heuristic, not authoritative attribution. Unmatched tags
+are returned separately rather than silently dropped, so the correlation
+agent (and a reader of its report) can see what wasn't mapped.
+
+### `search_prior_incidents` (`tools/correlation.py`) — real
+
+**Args**: `query` (masked text — never a real value), `top_k` (default 3).
+
+**What it does**: a thin wrapper around `RAGStore.search()` — the same
+call that used to run eagerly as a standalone `rag_retrieve` graph node
+now also exists as a tool the correlation agent can call again mid-turn,
+for a more targeted follow-up search than the initial retrieval. Same
+graceful-degradation behavior as the eager search (§6): returns `[]`
+rather than raising if Supabase isn't configured or a query fails.
+
+### `propose_firewall_block` (`tools/remediation.py`) — deliberately mock
+
+**Args**: `indicator` (masked token for the IP/domain to propose blocking),
+`reason` (str).
+
+**What it does**: records a proposed containment action and returns
+confirmation that it's `"proposed_pending_human_approval"` — **it never
+calls a real firewall or EDR API**. This is the one tool in the project
+whose real-world equivalent takes a genuinely destructive, high-blast-
+radius action rather than looking something up, so unlike
+`threat_intel_lookup`/`detonate_file` (real integrations with mock
+fallbacks), this one has no real-integration path at all by design. See
+docs/AGENT_ARCHITECTURE.md and §12 for why "recommend, don't
+auto-execute" is the deliberate scope here rather than a gap to fill in
+later.
+
 ---
 
 ## 11. What's real vs. mocked
@@ -599,11 +769,15 @@ this is the only path actually exercised in development so far (see §11).
 |---|---|
 | PII masking/unmasking | Real, regex-based entity detection |
 | Tool mask/unmask boundary | Real |
-| LangGraph supervisor/investigator/judge wiring | Real |
-| Judge loop (max 3) | Real |
+| LangGraph supervisor/investigator/correlation/remediation/judge wiring | Real — graph compiles with all 5 roles; verified with a placeholder key (no live LLM calls in this environment) |
+| Supervisor routing (LLM decision + structural guardrails) | Real logic, not live-LLM-tested here — `max_agent_steps` cap and the investigator-must-run-first / no-repeat-completed-agent validation are plain code, exercised by the graph-compile smoke test; the LLM's actual routing choices haven't been observed against a live model in this environment |
+| Judge loop (max 3) + revision targeting | Real — `target_agent` schema field and the supervisor's honor-then-clear logic (`revision_target_handled_at`) are implemented and compile-tested; not yet observed end-to-end against a live judge call |
 | Threat intel (`threat_intel_lookup`) | **Real** — VirusTotal + AlienVault OTX; mock fallback if neither key is set. Only the mock path has actually been exercised in this environment so far — the live integration has been verified against the providers' documented API shapes, not live-tested with real keys. |
 | Sandbox (`detonate_file`) | **Real** — Hybrid Analysis submit+poll+hash-search; mock fallback if `HYBRID_ANALYSIS_API_KEY` isn't set. Only the mock path and the offline logic (path/hash classification, missing-file handling) have actually been exercised here — the live submit/poll/summary flow hasn't been tested against a real key. |
 | File upload (web app) | **Real** — uploaded bytes are saved to a server-side temp file and cleaned up after the investigation completes, so `detonate_file` has real bytes to act on. Not yet exercised end-to-end here (needs a live `HYBRID_ANALYSIS_API_KEY` + a running frontend to actually drive an upload through). |
+| MITRE ATT&CK lookup (`mitre_attack_lookup`) | **Real** — curated local tag→technique table, no external call, no mock/real split. Exercised directly by `scripts/smoke_test_new_tools.py`. |
+| Prior-incident search (`search_prior_incidents`) | Real — same `RAGStore.search()` path as the eager correlation lookup; degrades to `[]` the same way (verified). |
+| Remediation (`propose_firewall_block`) | **Deliberately mock, no real-integration path** — see §10, §12. Exercised directly by `scripts/smoke_test_new_tools.py`. |
 | RAG store | Real Supabase/pgvector schema; degrades gracefully if unconfigured or if a query fails |
 | Embeddings | Real (OpenAI) automatically once `OPENAI_API_KEY` is set; hashing fallback otherwise |
 | Backend API (FastAPI) | Real — both endpoints verified to import/route correctly; the actual LLM round-trip through them hasn't been exercised in this environment (no live API keys here) |
@@ -617,8 +791,9 @@ placeholder value — it only compiles the graph, never calls the API):
 ```bash
 python scripts/smoke_test_masking.py         # mask/unmask roundtrip, no PII leakage
 python scripts/smoke_test_tools.py            # mask-aware tool boundary, mock threat intel + sandbox
-python scripts/smoke_test_rag.py               # hashing embedder + RAGStore no-op behavior
-python scripts/smoke_test_graph_compile.py      # graph wiring is internally consistent
+python scripts/smoke_test_new_tools.py         # MITRE lookup, prior-incident search, mock remediation
+python scripts/smoke_test_rag.py                # hashing embedder + RAGStore no-op behavior
+python scripts/smoke_test_graph_compile.py       # all 5 agent roles wired in; graph is internally consistent
 ```
 
 These exercise every layer except the actual LLM calls. Run a real
@@ -636,9 +811,24 @@ test those.
   answering policy questions first: should `needs_review` investigations
   be persisted at all, or only judge-satisfied ones? Is there a confidence
   floor? A dedicated node after `finalize`, or inline in it?
-- **Judge is same-provider as the investigator (OpenAI/OpenAI), temporarily.**
+- **Judge is same-provider as the specialists (OpenAI/OpenAI), temporarily.**
   See §7 — revisit once the pipeline is stable enough that free-tier
   Gemini rate limits aren't a development-loop annoyance.
+- **Remediation has no approval-workflow UI.** `propose_firewall_block` is
+  intentionally mock (§10) and every proposal is textually marked as
+  requiring human sign-off, but nothing currently *enforces* that — there's
+  no separate `pending_remediation_actions` state field, no approval
+  endpoint, no UI affordance to accept/reject a proposal. The report says
+  "requires approval"; nothing downstream currently gates on it. Adding a
+  real approval gate (state field + API endpoint + frontend affordance)
+  is the natural next step if this ever needed to do more than recommend
+  in prose.
+- **Supervisor and judge model choices aren't exposed on the CLI/API.**
+  `supervisor_model`, `correlation_model`, and `remediation_model` are
+  real, independent parameters on `build_graph()` (see §7) but only
+  `investigator_model`/`judge_model` are wired through to the CLI flags
+  and the FastAPI request body — a small surface-area gap, not a design
+  limitation.
 - **Vault persistence/expiry policy** if investigations ever need to be
   resumable across process restarts (currently in-memory only, scoped to
   one `graph.invoke()` call).

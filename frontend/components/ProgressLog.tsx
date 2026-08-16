@@ -2,8 +2,10 @@ import type { LogEntry } from "@/lib/types";
 
 const NODE_LABELS: Record<string, string> = {
   ingest_and_mask: "Masking input",
-  rag_retrieve: "Checking prior incidents",
+  supervisor: "Orchestrating",
   investigator: "Investigating",
+  correlation: "Correlating",
+  remediation: "Assessing remediation",
   judge: "Reviewing draft",
   finalize: "Finalizing",
 };

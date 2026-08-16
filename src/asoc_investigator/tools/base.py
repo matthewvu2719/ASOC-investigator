@@ -72,13 +72,28 @@ def build_mask_aware_tool(spec: ToolSpec, engine: MaskingEngine) -> StructuredTo
                     f"({exc})"
                 )
 
-        result = spec.impl(**resolved)
-        # Re-mask each value BEFORE serializing (see _mask_structure) — a
-        # tool response can legitimately echo back a real value (e.g.
-        # threat intel returning the queried IP in its payload), and it
-        # must never reach the agent's context unmasked.
-        masked_result = _mask_structure(result, engine)
-        return json.dumps(masked_result, indent=2, default=str)
+        try:
+            result = spec.impl(**resolved)
+            # Re-mask each value BEFORE serializing (see _mask_structure) —
+            # a tool response can legitimately echo back a real value (e.g.
+            # threat intel returning the queried IP in its payload), and it
+            # must never reach the agent's context unmasked.
+            masked_result = _mask_structure(result, engine)
+            return json.dumps(masked_result, indent=2, default=str)
+        except Exception as exc:
+            # Deliberately broad: individual tool implementations (VirusTotal
+            # / OTX / Hybrid Analysis calls) don't catch every failure mode —
+            # e.g. a malformed-but-200 response raising JSONDecodeError deep
+            # inside resp.json(). This is the shared boundary for every tool,
+            # current and future, so one catch here protects all of them.
+            # Never let an unexpected tool failure crash the whole graph
+            # invocation — surface it as a tool result the agent can react
+            # to instead.
+            return (
+                f"Error: {spec.name} failed unexpectedly ({exc!r}). Treat "
+                f"this indicator as unavailable rather than guessing at a "
+                f"verdict for it."
+            )
 
     return StructuredTool.from_function(
         func=_run,

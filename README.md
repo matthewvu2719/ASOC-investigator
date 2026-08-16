@@ -1,46 +1,55 @@
 # ASOC Investigator
 
 A multi-agent security investigation assistant. Give it a log excerpt or a
-suspicious file; it checks for similar prior incidents (RAG), enriches
-indicators via threat intel (VirusTotal + AlienVault OTX — reputation,
-geolocation, and campaign context in one call) and sandbox tools,
-self-reviews its own conclusions (LLM-as-judge, up to 3 revision passes),
-and returns a report with a confidence level — flagged for human review if
-the judge wasn't satisfied within budget.
+suspicious file; a **supervisor agent** orchestrates three specialists —
+**investigator** (threat intel + sandbox tools), **correlation** (prior
+similar incidents via RAG + MITRE ATT&CK mapping), and **remediation**
+(proposes containment actions — mocked, never auto-executed) — then an
+independent **judge** (a single evaluator call, not an agent) scores the
+combined report and can send it back to the exact specialist that needs to
+redo its part, up to 3 revision passes. Returns a report with a confidence
+level, flagged for human review if the judge wasn't satisfied within
+budget. See [`docs/AGENT_ARCHITECTURE.md`](docs/AGENT_ARCHITECTURE.md) for
+the condensed design rationale, or [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+for the full reference.
 
 **PII never reaches the LLM in plaintext.** Every IP, hostname, username,
 email, file path, and hash is replaced with a reversible token before
 anything is sent to a model; real values are only resolved inside the tool
 layer to make actual API calls, then re-masked before the result comes
-back. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full
-design, including why this is built as custom tools rather than MCP or
-bash.
+back. See `docs/ARCHITECTURE.md` for the full design, including why this
+is built as custom tools rather than MCP or bash.
 
-The investigator (ReAct agent, tool use) and judge both run on **OpenAI**
-right now — a temporary choice to avoid free-tier Gemini rate limits during
-development. Putting the judge on a different provider (e.g. Gemini) is a
-genuinely stronger independence check and worth doing once the pipeline is
-stable; both models are independent parameters, swappable without touching
-the rest of the code — see `docs/ARCHITECTURE.md` "Agents".
+All five agent roles run on **OpenAI** right now — a temporary choice to
+avoid free-tier Gemini rate limits during development. Putting the judge
+on a different provider (e.g. Gemini) is a genuinely stronger independence
+check and worth doing once the pipeline is stable; all five models are
+independent parameters, swappable without touching the rest of the code —
+see `docs/ARCHITECTURE.md` "Agents".
 
 ## Status
 
-v0.1 — architecture and pipeline are real and tested (masking round-trip,
-the tool mask/unmask boundary, RAG store degrade-gracefully behavior, and
-graph compilation all have smoke tests in `scripts/`). Both external tools
-are real: threat intel (VirusTotal + AlienVault OTX) when
+v0.2 — architecture and pipeline are real and tested (masking round-trip,
+the tool mask/unmask boundary, RAG store degrade-gracefully behavior, the
+new correlation/remediation tools, and full 5-node graph compilation all
+have smoke tests in `scripts/`). Two of the investigator's tools are real
+external integrations: threat intel (VirusTotal + AlienVault OTX) when
 `VIRUSTOTAL_API_KEY` / `OTX_API_KEY` are set, and sandbox detonation
 (Hybrid Analysis) when `HYBRID_ANALYSIS_API_KEY` is set — both fall back
-to a deterministic mock otherwise. See `docs/ARCHITECTURE.md` §11 for the
-full real-vs-mocked breakdown.
+to a deterministic mock otherwise. The remediation tool
+(`propose_firewall_block`) is **deliberately mock with no real-integration
+path** — see `docs/AGENT_ARCHITECTURE.md`. See `docs/ARCHITECTURE.md` §11
+for the full real-vs-mocked breakdown.
 
-The end-to-end LLM run (investigator + judge, which need a live
-`OPENAI_API_KEY`) has not been exercised yet in this environment — do that
-first before trusting the pipeline beyond the component-level tests. The
-VirusTotal/OTX/Hybrid Analysis integrations have likewise only been
-verified against their documented API shapes and offline logic (routing,
-classification, error handling), not live-tested against real keys — the
-mock fallback path is what's actually been run for all three.
+The end-to-end LLM run (all five agent roles need a live `OPENAI_API_KEY`)
+has not been exercised yet in this environment — do that first before
+trusting the pipeline beyond the component-level tests. In particular, the
+supervisor's actual routing decisions and the judge's revision-target
+attribution are structurally implemented and compile-tested but haven't
+been observed against a live model here. The VirusTotal/OTX/Hybrid
+Analysis integrations have likewise only been verified against their
+documented API shapes and offline logic, not live-tested against real
+keys — the mock fallback path is what's actually been run for all three.
 
 ## Setup
 
@@ -164,8 +173,9 @@ npm run dev
 ```
 
 Runs on `http://localhost:3000`. Fill in the form, submit, and watch the
-investigation progress live via Server-Sent Events (masking → RAG lookup →
-investigator → judge, looping up to `max_iterations` → final report).
+investigation progress live via Server-Sent Events (masking → supervisor
+routing between investigator/correlation/remediation → judge, looping back
+through the supervisor up to `max_iterations` → final report).
 
 The frontend build/typecheck/lint were verified in this environment; the
 actual SSE round-trip against a running backend was not (no LLM API keys
@@ -176,16 +186,20 @@ available here) — test that next.
 ```
 src/asoc_investigator/
   masking/    # reversible PII masking engine (the core safety boundary)
-  tools/      # mask-aware tool wrapper + threat intel (VT+OTX) / sandbox
+  tools/      # mask-aware tool wrapper + threat intel (VT+OTX) / sandbox /
+              # correlation (MITRE ATT&CK + RAG search) / remediation (mock)
   rag/        # Supabase/pgvector store + pluggable embeddings
-  agents/     # investigator (ReAct, OpenAI), judge (OpenAI for now), supervisor routing
+  agents/     # investigator, correlation, remediation (ReAct specialists),
+              # judge (single evaluator call), supervisor (LLM router)
+  report.py   # combine_report() — stitches the specialists' reports together
   graph/      # LangGraph StateGraph wiring + shared state schema
   api/        # FastAPI app: blocking + SSE-streaming investigation endpoints
   cli.py
 
 frontend/               # Next.js (TypeScript + Tailwind) — form, live
                          # progress view, report display
-docs/ARCHITECTURE.md   # design doc — read this first
+docs/ARCHITECTURE.md         # design doc — read this first
+docs/AGENT_ARCHITECTURE.md   # condensed agent/workflow design rationale
 scripts/                # smoke tests for each layer, runnable without an API key
                          # except smoke_test_graph_compile.py which needs one
                          # set (a placeholder value works — it only compiles,
@@ -197,10 +211,11 @@ scripts/                # smoke tests for each layer, runnable without an API ke
 ```bash
 python scripts/smoke_test_masking.py
 python scripts/smoke_test_tools.py
+python scripts/smoke_test_new_tools.py
 python scripts/smoke_test_rag.py
 python scripts/smoke_test_graph_compile.py
 ```
 
-These exercise every layer except the actual LLM calls (investigator ReAct
-loop, judge). Run a real `asoc-investigate "..."` with `OPENAI_API_KEY` set
-to test those.
+These exercise every layer except the actual LLM calls (the three ReAct
+specialists, the supervisor's routing decisions, the judge). Run a real
+`asoc-investigate "..."` with `OPENAI_API_KEY` set to test those.

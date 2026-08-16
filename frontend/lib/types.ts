@@ -12,8 +12,11 @@ export interface IncidentHit {
   similarity: number;
 }
 
+export type AgentName = "investigator" | "correlation" | "remediation";
+
 export interface JudgeVerdict {
   verdict: "satisfied" | "needs_revision";
+  target_agent: AgentName | null;
   confidence: number;
   feedback: string;
 }
@@ -24,7 +27,12 @@ export interface JudgeVerdict {
 export interface NodeUpdatePayload {
   masked_input?: string;
   prior_incidents?: IncidentHit[];
-  draft_report?: string;
+  investigator_report?: string;
+  correlation_report?: string;
+  remediation_report?: string;
+  agents_completed?: AgentName[];
+  agent_steps?: number;
+  supervisor_decision?: AgentName | "judge";
   judge_verdicts?: JudgeVerdict[];
   iteration?: number;
   final_report?: string;

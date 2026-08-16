@@ -11,14 +11,25 @@ function describeUpdate(node: string, payload: NodeUpdate[string]): string {
   switch (node) {
     case "ingest_and_mask":
       return "PII replaced with reversible tokens before anything reaches the LLM.";
-    case "rag_retrieve": {
-      const count = payload.prior_incidents?.length ?? 0;
-      return count > 0
-        ? `Found ${count} similar prior incident${count === 1 ? "" : "s"}.`
-        : "No similar prior incidents found.";
+    case "supervisor": {
+      const decision = payload.supervisor_decision;
+      if (!decision) return "Deciding what to do next...";
+      return decision === "judge"
+        ? "Enough evidence gathered — sending to the judge for review."
+        : `Dispatching the ${decision} agent.`;
     }
     case "investigator":
-      return "Draft report produced from tool findings and prior-incident context.";
+      return "Investigation findings produced from threat-intel and sandbox tool results.";
+    case "correlation": {
+      const count = payload.prior_incidents?.length ?? 0;
+      const priorNote =
+        count > 0
+          ? `${count} similar prior incident${count === 1 ? "" : "s"} found. `
+          : "No similar prior incidents found. ";
+      return `${priorNote}Correlated with MITRE ATT&CK context.`;
+    }
+    case "remediation":
+      return "Remediation recommendation produced (mock — proposals require human approval).";
     case "judge": {
       const verdicts = payload.judge_verdicts ?? [];
       const latest = verdicts[verdicts.length - 1];
@@ -26,7 +37,7 @@ function describeUpdate(node: string, payload: NodeUpdate[string]): string {
       const pct = Math.round(latest.confidence * 100);
       return latest.verdict === "satisfied"
         ? `Satisfied (confidence ${pct}%). ${latest.feedback}`
-        : `Needs revision (confidence ${pct}%): ${latest.feedback}`;
+        : `Needs revision, targeting ${latest.target_agent ?? "unspecified"} (confidence ${pct}%): ${latest.feedback}`;
     }
     case "finalize":
       return "Unmasked and finalized.";
@@ -96,8 +107,8 @@ export default function Home() {
       <header>
         <h1 className="text-xl font-semibold">ASOC Investigator</h1>
         <p className="text-sm text-black/60 dark:text-white/60">
-          PII-safe multi-agent security investigation. Investigator and judge both run on
-          OpenAI.
+          PII-safe multi-agent security investigation. A supervisor orchestrates investigator,
+          correlation, and remediation agents, with an independent judge reviewing the result.
         </p>
       </header>
 

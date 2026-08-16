@@ -26,7 +26,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from asoc_investigator.graph import build_graph
-from asoc_investigator.graph.state import DEFAULT_MAX_ITERATIONS
+from asoc_investigator.state import DEFAULT_MAX_ITERATIONS
 
 from .streaming import stream_graph_events
 
@@ -132,7 +132,12 @@ def _serialize_update(update: dict[str, Any]) -> dict[str, Any]:
             continue
         safe: dict[str, Any] = {}
         for key, value in partial.items():
-            if key in ("masking_engine", "investigator_messages"):
+            if key in (
+                "masking_engine",
+                "investigator_messages",
+                "correlation_messages",
+                "remediation_messages",
+            ):
                 continue
             if key == "prior_incidents":
                 safe[key] = [dataclasses.asdict(h) for h in value]
